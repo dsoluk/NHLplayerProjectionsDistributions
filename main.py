@@ -12,6 +12,13 @@ from scipy import stats
 EXCEL_PATH = r"C:\Users\soluk\OneDrive\Documents\FantasyNHL\NatePts.xlsx"
 PREFERRED_SHEET_NAME = "NatePts"  # Will fall back to the first sheet if not found
 
+# Category groups for scoring
+POINTS_CATEGORIES = ["G", "A", "PPP", "SOG"]
+BANGER_CATEGORIES = ["HIT", "BLK", "PIM"]
+
+# Default per-category weights for overall score. If empty or missing keys, equal weights are used.
+DEFAULT_CATEGORY_WEIGHTS: Dict[str, float] = {}
+
 
 @dataclass
 class FitResult:
@@ -65,6 +72,159 @@ def compute_ic(loglik: float, k: int, n: int) -> Tuple[float, float]:
     aic = 2 * k - 2 * loglik
     bic = k * math.log(max(n, 1)) - 2 * loglik
     return aic, bic
+
+
+def choose_best_fit(fits: List[FitResult]) -> Optional[FitResult]:
+    if not fits:
+        return None
+    return sorted(fits, key=lambda fr: fr.aic)[0]
+
+
+def get_scipy_dist(name: str):
+    if name == "Normal":
+        return stats.norm
+    if name == "LogNormal":
+        return stats.lognorm
+    if name == "Gamma":
+        return stats.gamma
+    raise ValueError(f"Unsupported distribution name: {name}")
+
+
+def value_score_from_fit(x: float, fit: FitResult, method: str = "cdf_z") -> Optional[float]:
+    """
+    Compute a standardized score for a single value x using the provided fitted distribution.
+    Methods:
+    - "cdf_z": distribution-aware z via z = Phi^{-1}(F(x)), clipped to avoid infinities.
+    - "mean_std": classic z = (x - mean)/std for Normal; for LogNormal uses log-scale; for Gamma uses moment std.
+    Returns None if x is NaN or cannot be scored.
+    """
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return None
+
+    dist = get_scipy_dist(fit.name)
+    params = fit.params
+
+    if method == "cdf_z":
+        try:
+            # Handle edge cases for strictly positive dists
+            if fit.name == "LogNormal":
+                # Ensure x > loc; our fits constrain loc=0
+                x_adj = max(1e-12, float(x))
+                cdf = float(dist.cdf(x_adj, *params))
+            else:
+                cdf = float(dist.cdf(float(x), *params))
+            cdf = min(max(cdf, 1e-12), 1 - 1e-12)
+            return float(stats.norm.ppf(cdf))
+        except Exception:
+            return None
+
+    elif method == "mean_std":
+        try:
+            if fit.name == "Normal":
+                mu, sigma = params
+                if sigma <= 0:
+                    return None
+                return (float(x) - mu) / sigma
+            elif fit.name == "LogNormal":
+                # params: shape (sigma), loc, scale (exp(mu)) when loc=0
+                shape, loc, scale = params
+                mu_log = math.log(scale)
+                sigma_log = shape
+                x_adj = max(1e-12, float(x) - loc)
+                return (math.log(x_adj) - mu_log) / sigma_log
+            elif fit.name == "Gamma":
+                a, loc, scale = params
+                mean = a * scale + loc
+                std = math.sqrt(a) * scale
+                if std <= 0:
+                    return None
+                return (float(x) - mean) / std
+            else:
+                return None
+        except Exception:
+            return None
+
+    else:
+        raise ValueError(f"Unknown scoring method: {method}")
+
+
+def compute_category_scores(
+    df: pd.DataFrame,
+    best_fits: Dict[str, FitResult],
+    points_categories: List[str],
+    banger_categories: List[str],
+    weights: Optional[Dict[str, float]] = None,
+    method: str = "cdf_z",
+) -> pd.DataFrame:
+    """
+    Computes per-category standardized scores using best-by-AIC fits and aggregates:
+    - Adds <col>_score columns for each category present.
+    - Adds PointsScore, BangerScore, and OverallScore columns.
+    weights: optional dict of per-category weights for OverallScore (defaults to equal weights for available categories).
+    method: "cdf_z" (default) or "mean_std".
+    """
+    df_out = df.copy()
+
+    available_points = [c for c in points_categories if c in df_out.columns]
+    available_banger = [c for c in banger_categories if c in df_out.columns]
+    all_cats = available_points + available_banger
+
+    # Create per-category score columns
+    for col in all_cats:
+        fit = best_fits.get(col)
+        if fit is None:
+            print(f"No fit available for category '{col}', cannot score it.")
+            continue
+        scores: List[Optional[float]] = []
+        ser = pd.to_numeric(df_out[col], errors='coerce')
+        for val in ser.fillna(np.nan).values:
+            scores.append(value_score_from_fit(val, fit, method=method))
+        df_out[f"{col}_score"] = pd.Series(scores, index=df_out.index, dtype="float64")
+
+    # Helper to average across available score columns
+    def mean_across(cols: List[str]) -> pd.Series:
+        score_cols = [f"{c}_score" for c in cols if f"{c}_score" in df_out.columns]
+        if not score_cols:
+            return pd.Series([np.nan] * len(df_out), index=df_out.index)
+        return df_out[score_cols].mean(axis=1, skipna=True)
+
+    df_out["PointsScore"] = mean_across(available_points)
+    df_out["BangerScore"] = mean_across(available_banger)
+
+    # Overall weighted average across all categories
+    if not all_cats:
+        df_out["OverallScore"] = np.nan
+        return df_out
+
+    # Determine weights per category
+    eff_weights: Dict[str, float] = {}
+    if weights:
+        for c in all_cats:
+            eff_weights[c] = float(weights.get(c, 1.0))
+    else:
+        for c in all_cats:
+            eff_weights[c] = 1.0
+
+    # Build weighted average of per-category scores
+    score_cols = [f"{c}_score" for c in all_cats if f"{c}_score" in df_out.columns]
+    if not score_cols:
+        df_out["OverallScore"] = np.nan
+        return df_out
+
+    # Align weights to columns
+    w_arr = np.array([eff_weights[c.replace("_score", "")] for c in score_cols], dtype=float)
+    w_arr = np.where(np.isfinite(w_arr), w_arr, 0.0)
+
+    # Weighted mean ignoring NaNs per row
+    scores_matrix = df_out[score_cols].values
+    weights_broadcast = np.tile(w_arr, (scores_matrix.shape[0], 1))
+    mask = np.isfinite(scores_matrix)
+    weighted_sum = np.nansum(scores_matrix * weights_broadcast * mask, axis=1)
+    weight_sum = np.nansum(weights_broadcast * mask, axis=1)
+    overall = np.divide(weighted_sum, weight_sum, out=np.full_like(weighted_sum, np.nan, dtype=float), where=weight_sum > 0)
+    df_out["OverallScore"] = overall
+
+    return df_out
 
 
 def fit_normal(x: np.ndarray) -> FitResult:
@@ -187,12 +347,13 @@ def coerce_specific_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFram
     return df
 
 
-def analyze_dataframe(df: pd.DataFrame, show_plots: bool = True) -> None:
+def analyze_dataframe(df: pd.DataFrame, show_plots: bool = True) -> Dict[str, FitResult]:
     # Select numeric columns only
     num_df = df.select_dtypes(include=[np.number])
+    best_fit_by_col: Dict[str, FitResult] = {}
     if num_df.shape[1] == 0:
         print("No numeric columns found in the sheet. Nothing to analyze.")
-        return
+        return best_fit_by_col
 
     for col in num_df.columns:
         x_raw = num_df[col].dropna().values.astype(float)
@@ -224,11 +385,16 @@ def analyze_dataframe(df: pd.DataFrame, show_plots: bool = True) -> None:
             print(f"Gamma fit failed for '{col}': {e}")
 
         summarize_results(col, fits)
+        best = choose_best_fit(fits)
+        if best is not None:
+            best_fit_by_col[col] = best
         if show_plots:
             try:
                 plot_column_with_fits(col, x_raw, fits)
             except Exception as e:
                 print(f"Plotting failed for '{col}': {e}")
+
+    return best_fit_by_col
 
 
 def main():
@@ -248,7 +414,52 @@ def main():
     print(list(df.columns))
     print()
 
-    analyze_dataframe(df, show_plots=True)
+    # Analyze and get best fits by column
+    best_fits = analyze_dataframe(df, show_plots=True)
+
+    # Prepare weights (can be customized later). If empty, equal weights are used.
+    category_weights = DEFAULT_CATEGORY_WEIGHTS
+
+    # Compute scores for requested categories
+    if best_fits:
+        print("Computing standardized scores using best-by-AIC distributions...")
+        scored_df = compute_category_scores(
+            df,
+            best_fits,
+            POINTS_CATEGORIES,
+            BANGER_CATEGORIES,
+            weights=category_weights,
+            method="cdf_z",
+        )
+
+        # Print summary of chosen best distributions for relevant categories
+        relevant_cols = [c for c in POINTS_CATEGORIES + BANGER_CATEGORIES if c in df.columns]
+        print("\nBest-by-AIC distributions for scoring:")
+        for col in relevant_cols:
+            fit = best_fits.get(col)
+            if fit:
+                print(f"  {col}: {fit.name}")
+            else:
+                print(f"  {col}: no fit available")
+
+        # Show a preview of the scores
+        score_columns = [f"{c}_score" for c in relevant_cols if f"{c}_score" in scored_df.columns] + [
+            "PointsScore", "BangerScore", "OverallScore"
+        ]
+        existing_score_columns = [c for c in score_columns if c in scored_df.columns]
+        with pd.option_context('display.max_columns', None, 'display.width', 200):
+            print("\nScore preview (first 10 rows):")
+            print(scored_df[existing_score_columns].head(10))
+
+        # Save full scored output to CSV at requested path
+        try:
+            output_path = r"C:\Users\soluk\Downloads\NateProj2526_scores.csv"
+            scored_df.to_csv(output_path, index=False)
+            print(f"\nScored output saved to: {output_path}")
+        except Exception as e:
+            print(f"\nFailed to save scored output to CSV: {e}")
+    else:
+        print("No fits were produced; skipping scoring.")
 
 
 if __name__ == '__main__':
