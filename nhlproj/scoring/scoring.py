@@ -188,3 +188,60 @@ def scale_scores(df: pd.DataFrame, mode: str = "percentile", columns: Optional[L
             pass
 
     return df_out
+
+
+def apply_pos_group_weighted_overall(
+    df: pd.DataFrame,
+    weights_map: Optional[Dict[str, tuple]] = None,
+    points_col: str = "PointsScore",
+    banger_col: str = "BangerScore",
+    pos_group_col: str = "pos_group",
+    balanced_col: str = "BalancedScore",
+    overall_col: str = "OverallScore",
+) -> pd.DataFrame:
+    """
+    Compute a role-aware overall score as a weighted combination of PointsScore and BangerScore.
+    - weights_map maps pos_group -> (w_points, w_banger). Supported keys: 'F','D','B','DEFAULT'.
+    - If one component is NaN for a row, renormalize to the available component so a valid score is still produced.
+    - Writes both `balanced_col` and `overall_col` (set equal by design) and returns a copy.
+    """
+    if weights_map is None:
+        weights_map = {
+            'F': (0.6, 0.4),
+            'D': (0.4, 0.6),
+            'B': (0.5, 0.5),
+            'DEFAULT': (0.5, 0.5),
+        }
+
+    df_out = df.copy()
+
+    # Prepare arrays
+    p = pd.to_numeric(df_out.get(points_col, pd.Series(np.nan, index=df_out.index)), errors='coerce').values
+    b = pd.to_numeric(df_out.get(banger_col, pd.Series(np.nan, index=df_out.index)), errors='coerce').values
+
+    # Map pos_group to weights
+    groups = df_out.get(pos_group_col, pd.Series(['DEFAULT'] * len(df_out), index=df_out.index)).fillna('DEFAULT').astype(str).values
+    wP = np.zeros(len(df_out), dtype=float)
+    wB = np.zeros(len(df_out), dtype=float)
+
+    for key, (wp, wb) in weights_map.items():
+        mask = (groups == key)
+        wP[mask] = float(wp)
+        wB[mask] = float(wb)
+    # Fill any remaining with DEFAULT
+    default_wp, default_wb = weights_map.get('DEFAULT', (0.5, 0.5))
+    remaining = (wP == 0) & (wB == 0)
+    if remaining.any():
+        wP[remaining] = float(default_wp)
+        wB[remaining] = float(default_wb)
+
+    # Renormalize when one component is missing per row
+    p_mask = np.isfinite(p)
+    b_mask = np.isfinite(b)
+    denom = (wP * p_mask) + (wB * b_mask)
+    numer = (wP * np.where(p_mask, p, 0.0)) + (wB * np.where(b_mask, b, 0.0))
+    combined = np.divide(numer, denom, out=np.full_like(numer, np.nan, dtype=float), where=denom > 0)
+
+    df_out[balanced_col] = combined
+    df_out[overall_col] = combined
+    return df_out
